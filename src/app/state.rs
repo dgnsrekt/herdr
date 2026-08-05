@@ -1295,6 +1295,109 @@ impl ContextMenuState {
             ],
         }
     }
+
+    /// The plugin action context this menu corresponds to, so a plugin can
+    /// declare `contexts = ["tab"]` and have it mean this menu.
+    pub fn plugin_context(&self) -> crate::api::schema::PluginActionContext {
+        use crate::api::schema::PluginActionContext as Ctx;
+        match self.kind {
+            ContextMenuKind::Workspace { .. } | ContextMenuKind::GitWorkspace { .. } => {
+                Ctx::Workspace
+            }
+            ContextMenuKind::Tab { .. } => Ctx::Tab,
+            ContextMenuKind::Pane { .. } => Ctx::Pane,
+        }
+    }
+
+    /// The tab this menu acts on, if it acts on one. Workspace menus do not.
+    pub fn target_tab(&self) -> Option<(usize, usize)> {
+        match self.kind {
+            ContextMenuKind::Workspace { .. } | ContextMenuKind::GitWorkspace { .. } => None,
+            ContextMenuKind::Tab { ws_idx, tab_idx } => Some((ws_idx, tab_idx)),
+            ContextMenuKind::Pane {
+                ws_idx, tab_idx, ..
+            } => Some((ws_idx, tab_idx)),
+        }
+    }
+}
+
+/// Whether an action carrying `when` should be offered for a menu whose target
+/// tab holds `pane_count` panes. `None` pane count means the menu has no tab to
+/// judge (a workspace menu): a precondition that cannot be evaluated cannot be
+/// asserted to hold, so a conditional action stays hidden.
+pub(crate) fn menu_action_is_visible(
+    when: Option<crate::api::schema::PluginActionCondition>,
+    pane_count: Option<usize>,
+) -> bool {
+    use crate::api::schema::PluginActionCondition as Cond;
+    match (when, pane_count) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(Cond::SinglePane), Some(count)) => count <= 1,
+        (Some(Cond::SplitPanes), Some(count)) => count >= 2,
+    }
+}
+
+impl AppState {
+    /// Pane count of the tab this menu targets.
+    ///
+    /// Goes through `ws.tabs.get(tab_idx)` on purpose: `Workspace` derefs to the
+    /// *active* tab, so `ws.layout.pane_count()` would silently answer for the
+    /// wrong tab whenever a non-active tab is right-clicked.
+    fn menu_target_pane_count(&self, menu: &ContextMenuState) -> Option<usize> {
+        let (ws_idx, tab_idx) = menu.target_tab()?;
+        self.workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.tabs.get(tab_idx))
+            .map(|tab| tab.layout.pane_count())
+    }
+
+    /// Enabled plugin actions whose `contexts` match `menu` and whose `when`
+    /// precondition holds, as (qualified action id, menu label). Sorted for a
+    /// stable menu order.
+    pub(crate) fn plugin_menu_actions(&self, menu: &ContextMenuState) -> Vec<(String, String)> {
+        let wanted = menu.plugin_context();
+        // hoisted: one lookup per menu, not one per action
+        let pane_count = self.menu_target_pane_count(menu);
+        let mut plugins: Vec<_> = self
+            .installed_plugins
+            .values()
+            .filter(|plugin| plugin.enabled)
+            .collect();
+        plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+        plugins
+            .into_iter()
+            .flat_map(|plugin| {
+                plugin
+                    .actions
+                    .iter()
+                    .filter(move |action| {
+                        action.contexts.contains(&wanted)
+                            && menu_action_is_visible(action.when, pane_count)
+                    })
+                    .map(|action| {
+                        (
+                            format!("{}.{}", plugin.plugin_id, action.id),
+                            action.title.clone(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Everything the menu draws: built-in items first, then plugin actions.
+    /// Any index at or past `menu.items().len()` is a plugin action.
+    pub(crate) fn context_menu_entries(&self, menu: &ContextMenuState) -> Vec<String> {
+        menu.items()
+            .iter()
+            .map(|item| (*item).to_string())
+            .chain(
+                self.plugin_menu_actions(menu)
+                    .into_iter()
+                    .map(|(_, title)| title),
+            )
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2269,6 +2372,229 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    fn menu(kind: ContextMenuKind) -> ContextMenuState {
+        ContextMenuState {
+            kind,
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        }
+    }
+
+    // built through serde so this fixture survives upstream adding fields —
+    // this patch gets rebased onto every release. Going through serde also
+    // exercises the `when` deserializer ("single_pane" -> SinglePane) for free.
+    fn state_with_action(
+        enabled: bool,
+        when: Option<&str>,
+        contexts: &[&str],
+        panes: usize,
+    ) -> AppState {
+        let mut state = AppState::test_new();
+
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        for _ in 1..panes {
+            workspace.test_split(ratatui::layout::Direction::Horizontal);
+        }
+        assert_eq!(
+            workspace.tabs[0].layout.pane_count(),
+            panes,
+            "fixture should hold {panes} panes"
+        );
+        state.workspaces.push(workspace);
+
+        let mut action = serde_json::json!({
+            "id": "on",
+            "title": "Yoke a tab alongside",
+            "contexts": contexts,
+            "command": ["true"],
+        });
+        if let Some(when) = when {
+            action["when"] = serde_json::Value::String(when.to_string());
+        }
+        let plugin: crate::api::schema::InstalledPluginInfo =
+            serde_json::from_value(serde_json::json!({
+                "plugin_id": "dgnsrekt.yoke",
+                "name": "yoke",
+                "version": "0.1.0",
+                "manifest_path": "",
+                "plugin_root": "",
+                "enabled": enabled,
+                "actions": [action],
+            }))
+            .expect("plugin fixture");
+        state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        state
+    }
+
+    fn state_with_tab_action(enabled: bool) -> AppState {
+        state_with_action(enabled, None, &["tab"], 1)
+    }
+
+    #[test]
+    fn tab_context_menu_appends_matching_plugin_actions() {
+        let state = state_with_tab_action(true);
+        let tab_menu = menu(ContextMenuKind::Tab {
+            ws_idx: 0,
+            tab_idx: 0,
+        });
+
+        // built-ins stay first and unchanged; the plugin action lands after them
+        assert_eq!(
+            state.context_menu_entries(&tab_menu),
+            vec!["New tab", "Rename", "Close", "Yoke a tab alongside"]
+        );
+        assert_eq!(
+            state.plugin_menu_actions(&tab_menu),
+            vec![(
+                "dgnsrekt.yoke.on".to_string(),
+                "Yoke a tab alongside".to_string()
+            )]
+        );
+
+        // a tab-context action must not leak into other menus
+        let workspace_menu = menu(ContextMenuKind::Workspace { ws_idx: 0 });
+        assert_eq!(
+            state.context_menu_entries(&workspace_menu),
+            vec!["Rename", "Close"]
+        );
+    }
+
+    #[test]
+    fn disabled_plugins_contribute_no_menu_items() {
+        let state = state_with_tab_action(false);
+        let tab_menu = menu(ContextMenuKind::Tab {
+            ws_idx: 0,
+            tab_idx: 0,
+        });
+        assert_eq!(
+            state.context_menu_entries(&tab_menu),
+            vec!["New tab", "Rename", "Close"]
+        );
+    }
+
+    #[test]
+    fn menu_action_visibility_covers_every_condition_and_target() {
+        use crate::api::schema::PluginActionCondition as Cond;
+
+        // (when, pane_count, visible)
+        let cases = [
+            // unconditional actions ignore the target entirely
+            (None, None, true),
+            (None, Some(1), true),
+            (None, Some(2), true),
+            // a precondition that cannot be evaluated cannot hold
+            (Some(Cond::SinglePane), None, false),
+            (Some(Cond::SplitPanes), None, false),
+            (Some(Cond::SinglePane), Some(1), true),
+            (Some(Cond::SinglePane), Some(2), false),
+            (Some(Cond::SplitPanes), Some(1), false),
+            (Some(Cond::SplitPanes), Some(2), true),
+            // "split" means more than one, not exactly two
+            (Some(Cond::SplitPanes), Some(3), true),
+        ];
+
+        for (when, pane_count, expected) in cases {
+            assert_eq!(
+                menu_action_is_visible(when, pane_count),
+                expected,
+                "when={when:?} pane_count={pane_count:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_pane_action_is_hidden_once_the_tab_is_split() {
+        let tab_menu = menu(ContextMenuKind::Tab {
+            ws_idx: 0,
+            tab_idx: 0,
+        });
+
+        let unsplit = state_with_action(true, Some("single_pane"), &["tab"], 1);
+        assert_eq!(
+            unsplit.context_menu_entries(&tab_menu),
+            vec!["New tab", "Rename", "Close", "Yoke a tab alongside"]
+        );
+
+        let split = state_with_action(true, Some("single_pane"), &["tab"], 2);
+        assert_eq!(
+            split.context_menu_entries(&tab_menu),
+            vec!["New tab", "Rename", "Close"]
+        );
+    }
+
+    #[test]
+    fn split_panes_action_appears_only_once_the_tab_is_split() {
+        let tab_menu = menu(ContextMenuKind::Tab {
+            ws_idx: 0,
+            tab_idx: 0,
+        });
+
+        let unsplit = state_with_action(true, Some("split_panes"), &["tab"], 1);
+        assert_eq!(
+            unsplit.context_menu_entries(&tab_menu),
+            vec!["New tab", "Rename", "Close"]
+        );
+
+        let split = state_with_action(true, Some("split_panes"), &["tab"], 2);
+        assert_eq!(
+            split.context_menu_entries(&tab_menu),
+            vec!["New tab", "Rename", "Close", "Yoke a tab alongside"]
+        );
+    }
+
+    #[test]
+    fn conditional_action_is_hidden_when_the_menu_has_no_tab() {
+        let state = state_with_action(true, Some("single_pane"), &["workspace"], 1);
+        let workspace_menu = menu(ContextMenuKind::Workspace { ws_idx: 0 });
+        assert_eq!(
+            state.context_menu_entries(&workspace_menu),
+            vec!["Rename", "Close"]
+        );
+
+        // ...but an unconditional workspace action still shows there
+        let unconditional = state_with_action(true, None, &["workspace"], 1);
+        assert_eq!(
+            unconditional.context_menu_entries(&workspace_menu),
+            vec!["Rename", "Close", "Yoke a tab alongside"]
+        );
+    }
+
+    #[test]
+    fn condition_reads_the_clicked_tab_not_the_active_one() {
+        // Regression guard: `Workspace` derefs to the ACTIVE tab, so a
+        // "simplification" to `ws.layout.pane_count()` would answer for tab 1
+        // here and wrongly hide the action on the single-pane tab 0.
+        let mut state = state_with_action(true, Some("single_pane"), &["tab"], 1);
+        let workspace = &mut state.workspaces[0];
+        let second = workspace.test_add_tab(Some("second"));
+        workspace.active_tab = second;
+        workspace.test_split(ratatui::layout::Direction::Horizontal);
+        assert_eq!(workspace.active_tab_index(), 1, "second tab must be active");
+        assert_eq!(workspace.tabs[0].layout.pane_count(), 1);
+        assert_eq!(workspace.tabs[1].layout.pane_count(), 2);
+
+        let clicked_unsplit_tab = menu(ContextMenuKind::Tab {
+            ws_idx: 0,
+            tab_idx: 0,
+        });
+        assert_eq!(
+            state.context_menu_entries(&clicked_unsplit_tab),
+            vec!["New tab", "Rename", "Close", "Yoke a tab alongside"]
+        );
+
+        let clicked_split_tab = menu(ContextMenuKind::Tab {
+            ws_idx: 0,
+            tab_idx: 1,
+        });
+        assert_eq!(
+            state.context_menu_entries(&clicked_split_tab),
+            vec!["New tab", "Rename", "Close"]
+        );
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {

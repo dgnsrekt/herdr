@@ -56,6 +56,8 @@ struct RawPluginManifestAction {
     #[serde(default)]
     contexts: Vec<crate::api::schema::PluginActionContext>,
     #[serde(default)]
+    when: Option<crate::api::schema::PluginActionCondition>,
+    #[serde(default)]
     platforms: Option<Vec<RawPlatform>>,
     command: Vec<String>,
 }
@@ -401,6 +403,7 @@ fn normalize_manifest_action(
         title,
         description,
         contexts: action.contexts,
+        when: action.when,
         platforms,
         command,
     })

@@ -248,6 +248,12 @@ pub struct PluginManifestAction {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contexts: Vec<PluginActionContext>,
+    /// Optional visibility precondition, evaluated against the menu's target.
+    /// `schemars(skip)` keeps the generated API schema artifact byte-identical
+    /// so this downstream patch never conflicts with upstream regenerating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub when: Option<PluginActionCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<PluginPlatform>>,
     pub command: Vec<String>,
@@ -358,6 +364,21 @@ pub enum PluginActionContext {
     Tab,
     Pane,
     Selection,
+}
+
+/// Precondition on the menu target that must hold for an action to be offered.
+/// Deliberately an enum rather than a pane-count comparison: pane count is the
+/// current approximation of "is this tab split", and an enum lets that
+/// definition change without invalidating installed manifests.
+///
+/// No `JsonSchema` derive — see the note on `PluginManifestAction::when`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginActionCondition {
+    /// The target tab holds exactly one pane.
+    SinglePane,
+    /// The target tab holds more than one pane.
+    SplitPanes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

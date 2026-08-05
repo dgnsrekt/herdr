@@ -980,8 +980,13 @@ pub(crate) fn handle_context_menu_key(
             }
         }
         KeyCode::Down => {
+            let len = state
+                .context_menu
+                .as_ref()
+                .map(|menu| state.context_menu_entries(menu).len())
+                .unwrap_or(0);
             if let Some(menu) = &mut state.context_menu {
-                menu.list.move_next(menu.items().len());
+                menu.list.move_next(len);
             }
         }
         KeyCode::Enter => {
@@ -1180,8 +1185,14 @@ impl App {
                 }
             }
             KeyCode::Down => {
+                let len = self
+                    .state
+                    .context_menu
+                    .as_ref()
+                    .map(|menu| self.state.context_menu_entries(menu).len())
+                    .unwrap_or(0);
                 if let Some(menu) = &mut self.state.context_menu {
-                    menu.list.move_next(menu.items().len());
+                    menu.list.move_next(len);
                 }
             }
             KeyCode::Enter => {
@@ -1194,7 +1205,48 @@ impl App {
         }
     }
 
+    /// Run the plugin action sitting at `offset` in the menu's plugin section.
+    /// Focuses whatever was right-clicked first, so the plugin's invocation
+    /// context is that target rather than whatever happened to hold focus.
+    fn invoke_context_menu_plugin_action(&mut self, menu: &ContextMenuState, offset: usize) {
+        let Some((action_id, _)) = self.state.plugin_menu_actions(menu).into_iter().nth(offset)
+        else {
+            return;
+        };
+        match menu.kind {
+            ContextMenuKind::Workspace { ws_idx }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
+                self.focus_workspace_idx_via_api(ws_idx);
+            }
+            ContextMenuKind::Tab { ws_idx, tab_idx } => {
+                self.focus_workspace_idx_via_api(ws_idx);
+                self.focus_tab_idx_via_api(tab_idx);
+            }
+            ContextMenuKind::Pane {
+                ws_idx, pane_id, ..
+            } => {
+                self.state.focus_pane_in_workspace(ws_idx, pane_id);
+            }
+        }
+        if let Err(err) = self.invoke_plugin_action_from_menu(action_id) {
+            let previous_toast = self.state.toast.clone();
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::NeedsAttention,
+                title: "plugin action failed".to_string(),
+                context: err,
+                position: None,
+                target: None,
+            });
+            self.sync_toast_deadline(previous_toast);
+        }
+    }
+
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
+        if idx >= menu.items().len() {
+            self.invoke_context_menu_plugin_action(&menu, idx - menu.items().len());
+            leave_modal(&mut self.state);
+            return;
+        }
         let item = menu.items().get(idx).copied();
         match (menu.kind, item) {
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {

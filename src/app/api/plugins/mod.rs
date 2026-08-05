@@ -226,6 +226,21 @@ impl App {
         &mut self,
         action_id: String,
     ) -> Result<(), String> {
+        self.invoke_plugin_action_with_source(action_id, "keybinding")
+    }
+
+    pub(crate) fn invoke_plugin_action_from_menu(
+        &mut self,
+        action_id: String,
+    ) -> Result<(), String> {
+        self.invoke_plugin_action_with_source(action_id, "context_menu")
+    }
+
+    fn invoke_plugin_action_with_source(
+        &mut self,
+        action_id: String,
+        source: &str,
+    ) -> Result<(), String> {
         self.refresh_installed_plugins()
             .map_err(|err| format!("failed to load plugin registry: {err}"))?;
         let (plugin, action) = self
@@ -239,8 +254,8 @@ impl App {
             &action.qualified_id(),
         )
         .map_err(|(_, message)| message)?;
-        let mut context = self.current_plugin_context("keybinding");
-        context.invocation_source = Some("keybinding".to_string());
+        let mut context = self.current_plugin_context(source);
+        context.invocation_source = Some(source.to_string());
         self.start_plugin_command(
             &plugin,
             Some(action.action_id),
