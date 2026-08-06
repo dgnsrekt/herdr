@@ -1226,14 +1226,14 @@ impl AppState {
     pub(crate) fn context_menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
         let screen = self.screen_rect();
-        let max_item_w = menu
-            .items()
+        let entries = self.context_menu_entries(menu);
+        let max_item_w = entries
             .iter()
-            .map(|item| item.len() as u16)
+            .map(|item| item.chars().count() as u16)
             .max()
             .unwrap_or(0);
         let menu_w = (max_item_w + 4).max(14).min(screen.width.max(1));
-        let menu_h = (menu.items().len() as u16 + 2).min(screen.height.max(1));
+        let menu_h = (entries.len() as u16 + 2).min(screen.height.max(1));
         let x = menu.x.min(screen.x + screen.width.saturating_sub(menu_w));
         let y = menu.y.min(screen.y + screen.height.saturating_sub(menu_h));
         Some(Rect::new(x, y, menu_w, menu_h))
@@ -1252,7 +1252,7 @@ impl AppState {
         let item_count = self
             .context_menu
             .as_ref()
-            .map(|menu| menu.items().len() as u16)
+            .map(|menu| self.context_menu_entries(menu).len() as u16)
             .unwrap_or(0);
         if col >= inner_x
             && col < inner_x + inner_w

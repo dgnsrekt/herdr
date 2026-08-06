@@ -1295,6 +1295,62 @@ impl ContextMenuState {
             ],
         }
     }
+
+    /// The plugin action context this menu corresponds to, so a plugin can
+    /// declare `contexts = ["tab"]` and have it mean this menu.
+    pub fn plugin_context(&self) -> crate::api::schema::PluginActionContext {
+        use crate::api::schema::PluginActionContext as Ctx;
+        match self.kind {
+            ContextMenuKind::Workspace { .. } | ContextMenuKind::GitWorkspace { .. } => {
+                Ctx::Workspace
+            }
+            ContextMenuKind::Tab { .. } => Ctx::Tab,
+            ContextMenuKind::Pane { .. } => Ctx::Pane,
+        }
+    }
+}
+
+impl AppState {
+    /// Enabled plugin actions whose `contexts` match `menu`, as
+    /// (qualified action id, menu label). Sorted for a stable menu order.
+    pub(crate) fn plugin_menu_actions(&self, menu: &ContextMenuState) -> Vec<(String, String)> {
+        let wanted = menu.plugin_context();
+        let mut plugins: Vec<_> = self
+            .installed_plugins
+            .values()
+            .filter(|plugin| plugin.enabled)
+            .collect();
+        plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+        plugins
+            .into_iter()
+            .flat_map(|plugin| {
+                plugin
+                    .actions
+                    .iter()
+                    .filter(move |action| action.contexts.contains(&wanted))
+                    .map(|action| {
+                        (
+                            format!("{}.{}", plugin.plugin_id, action.id),
+                            action.title.clone(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Everything the menu draws: built-in items first, then plugin actions.
+    /// Any index at or past `menu.items().len()` is a plugin action.
+    pub(crate) fn context_menu_entries(&self, menu: &ContextMenuState) -> Vec<String> {
+        menu.items()
+            .iter()
+            .map(|item| (*item).to_string())
+            .chain(
+                self.plugin_menu_actions(menu)
+                    .into_iter()
+                    .map(|(_, title)| title),
+            )
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2269,6 +2325,87 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    fn menu(kind: ContextMenuKind) -> ContextMenuState {
+        ContextMenuState {
+            kind,
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        }
+    }
+
+    // built through serde rather than a struct literal so the fixture keeps
+    // compiling when fields are added to the manifest types.
+    fn state_with_action(enabled: bool, contexts: &[&str]) -> AppState {
+        let mut state = AppState::test_new();
+        let plugin: crate::api::schema::InstalledPluginInfo =
+            serde_json::from_value(serde_json::json!({
+                "plugin_id": "example.split",
+                "name": "split",
+                "version": "0.1.0",
+                "manifest_path": "",
+                "plugin_root": "",
+                "enabled": enabled,
+                "actions": [{
+                    "id": "open",
+                    "title": "Open alongside",
+                    "contexts": contexts,
+                    "command": ["true"],
+                }],
+            }))
+            .expect("plugin fixture");
+        state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        state
+    }
+
+    fn state_with_tab_action(enabled: bool) -> AppState {
+        state_with_action(enabled, &["tab"])
+    }
+
+    #[test]
+    fn tab_context_menu_appends_matching_plugin_actions() {
+        let state = state_with_tab_action(true);
+        let tab_menu = menu(ContextMenuKind::Tab {
+            ws_idx: 0,
+            tab_idx: 0,
+        });
+
+        // built-ins stay first and unchanged; the plugin action lands after them
+        assert_eq!(
+            state.context_menu_entries(&tab_menu),
+            vec!["New tab", "Rename", "Close", "Open alongside"]
+        );
+        assert_eq!(
+            state.plugin_menu_actions(&tab_menu),
+            vec![(
+                "example.split.open".to_string(),
+                "Open alongside".to_string()
+            )]
+        );
+
+        // a tab-context action must not leak into other menus
+        let workspace_menu = menu(ContextMenuKind::Workspace { ws_idx: 0 });
+        assert_eq!(
+            state.context_menu_entries(&workspace_menu),
+            vec!["Rename", "Close"]
+        );
+    }
+
+    #[test]
+    fn disabled_plugins_contribute_no_menu_items() {
+        let state = state_with_tab_action(false);
+        let tab_menu = menu(ContextMenuKind::Tab {
+            ws_idx: 0,
+            tab_idx: 0,
+        });
+        assert_eq!(
+            state.context_menu_entries(&tab_menu),
+            vec!["New tab", "Rename", "Close"]
+        );
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {
